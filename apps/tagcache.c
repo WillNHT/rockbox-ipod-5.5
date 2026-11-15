@@ -3426,6 +3426,16 @@ static bool commit(void)
     /* Fully initialize existing headers (if any) before going further. */
     tc_stat.ready = check_all_headers();
 
+    /* Nothing new and the db is intact: don't steal buffers for nothing. */
+    if (tch.entry_count == 0 && tc_stat.ready)
+    {
+        close(tmpfd);
+        remove_db_file(TAGCACHE_FILE_TEMP);
+        tc_stat.commit_delayed = false;
+        tc_stat.readyvalid = true;
+        return true;
+    }
+
 #ifdef HAVE_EEPROM_SETTINGS
     remove_db_file(TAGCACHE_STATEFILE);
 #endif
