@@ -1,0 +1,90 @@
+name: Upstream sync
+
+# Upstream Rockbox is a real git upstream for this fork: its master merges
+# straight in. Once a week this merges Rockbox/rockbox master (the GitHub
+# mirror of git.rockbox.org) into a branch and opens - or refreshes - one
+# pull request for it. A merge that conflicts opens an issue instead; it
+# has to be resolved by hand.
+#
+# A branch pushed and a PR opened with the workflow's own token start no
+# workflow runs, so the build does not run on the sync PR by itself: close
+# and reopen it (or push to it) to get CI before merging.
+#
+# Friday 05:00 UTC+7, which is Thursday 22:00 UTC.
+on:
+  schedule:
+    - cron: "0 22 * * 4"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: sync/upstream
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Merge upstream master
+      id: merge
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git remote add upstream https://github.com/Rockbox/rockbox.git
+        git fetch --quiet upstream master
+        behind=$(git rev-list --count HEAD..upstream/master)
+        echo "behind=$behind" >> "$GITHUB_OUTPUT"
+        if [ "$behind" = 0 ]; then
+          echo "Up to date with upstream."
+          exit 0
+        fi
+        echo "$behind upstream commit(s) to merge."
+        git switch -c "$BRANCH"
+        if git merge --no-edit upstream/master \
+             -m "chore(upstream): merge Rockbox master" \
+             -m "$(git log --oneline --no-merges HEAD..upstream/master | head -50)"; then
+          echo "result=merged" >> "$GITHUB_OUTPUT"
+        else
+          git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+          git merge --abort
+          echo "result=conflict" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Open or refresh the pull request
+      if: steps.merge.outputs.result == 'merged'
+      env:
+        BEHIND: ${{ steps.merge.outputs.behind }}
+      run: |
+        git push --force origin "$BRANCH"
+        body="Merges $BEHIND new commit(s) from [Rockbox/rockbox](https://github.com/Rockbox/rockbox) master. Opened by \`.github/workflows/upstream-sync.yml\`; close and reopen to run CI."
+        if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+          gh pr create --head "$BRANCH" --base "${{ github.event.repository.default_branch }}" \
+            --title "chore(upstream): merge Rockbox master" --body "$body"
+        else
+          echo "Sync PR already open; branch refreshed."
+        fi
+
+    - name: Report a conflict
+      if: steps.merge.outputs.result == 'conflict'
+      run: |
+        title="Upstream merge conflicts"
+        body=$(printf 'Merging Rockbox/rockbox master needs a hand. Conflicting files:\n\n```\n%s\n```\n\n```sh\ngit fetch https://github.com/Rockbox/rockbox.git master\ngit merge FETCH_HEAD\n```' "$(cat /tmp/conflicts.txt)")
+        existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+        if [ -n "$existing" ]; then
+          gh issue comment "$existing" --body "$body"
+        else
+          gh issue create --title "$title" --label upstream --body "$body" ||
+            gh issue create --title "$title" --body "$body"
+        fi

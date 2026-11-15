@@ -1,0 +1,219 @@
+name: iPod Video release
+
+# Produces files that go straight onto the iPod, attached to a GitHub
+# Release instead of buried in a double-zipped Actions artifact.
+#
+#   push to master       -> the next semantic version, worked out from the
+#                           Conventional Commit messages (and PR titles)
+#                           since the last vX.Y.Z tag - see
+#                           tools/release/next-version.sh - is tagged and
+#                           released
+#   push a tag v*        -> that tag is released
+#   manual dispatch      -> the given tag, or the next version if blank
+#
+# The version is baked into the firmware (make VERSION=...), so the
+# iPod's System > Rockbox Info shows the release it came from.
+on:
+  push:
+    tags: ['v*']
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create (blank = next semantic version)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+# One release at a time, in order: two merges in quick succession must not
+# both compute the same "next" version, and a queued run must not be
+# cancelled, or its changes would never be released under their own number.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    name: Pick version
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      bump: ${{ steps.pick.outputs.bump }}
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Pick
+      id: pick
+      env:
+        INPUT_TAG: ${{ inputs.tag }}
+      run: |
+        if [ "$GITHUB_REF_TYPE" = tag ]; then
+          echo "tag=$GITHUB_REF_NAME" >> $GITHUB_OUTPUT
+          echo "bump=manual" >> $GITHUB_OUTPUT
+        elif [ -n "$INPUT_TAG" ]; then
+          echo "tag=$INPUT_TAG" >> $GITHUB_OUTPUT
+          echo "bump=manual" >> $GITHUB_OUTPUT
+        else
+          sh tools/release/next-version.sh | tee next.txt
+          . ./next.txt
+          echo "tag=$next" >> $GITHUB_OUTPUT
+          echo "bump=$bump" >> $GITHUB_OUTPUT
+          echo "### $previous -> $next ($bump)" >> $GITHUB_STEP_SUMMARY
+        fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.bump != 'none'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: firmware
+            type: N
+          - name: bootloader
+            type: B
+    runs-on: ubuntu-latest
+    name: Build ${{ matrix.name }}
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0  # version string comes from git describe
+
+    - name: Install dependencies
+      timeout-minutes: 15
+      run: |
+        sudo apt-get -o Acquire::Retries=5 update
+        sudo apt-get -o Acquire::Retries=5 install -y automake bison build-essential ccache flex libc6-dev libgmp3-dev libmpfr-dev \
+        libsdl1.2-dev libtool-bin texinfo zip gawk wget libmpc-dev gettext gtk-doc-tools
+
+    - name: root suid tar
+      run: sudo chown root /bin/tar && sudo chmod u+s /bin/tar
+
+    - name: Restore toolchain
+      id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: /tmp/local
+        # Same key as build.yml, so the two workflows share the toolchain.
+        key: ${{ runner.os }}-toolchain-a-${{ hashFiles('tools/rockboxdev.sh') }}
+
+    - name: Build toolchain
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        cd tools
+        chmod +x rockboxdev.sh
+        sudo ./rockboxdev.sh --target=a --prefix=/tmp/local
+
+    - name: Save toolchain
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: /tmp/local
+        key: ${{ runner.os }}-toolchain-a-${{ hashFiles('tools/rockboxdev.sh') }}
+
+    - name: Build
+      env:
+        VERSION: ${{ needs.version.outputs.tag }}
+      run: |
+        export PATH=/tmp/local/bin:$PATH
+        mkdir build && cd build
+        ../tools/configure --target=ipodvideo --type=${{ matrix.type }}
+        make -j$(nproc) VERSION="$VERSION"
+        mkdir ../out
+        if [ "${{ matrix.type }}" = B ]; then
+          cp bootloader-ipodvideo.ipod ../out/
+        else
+          # fontzip first: with rockbox.zip already present, its NODEPS rule
+          # would consider the target up to date and write nothing.
+          make fontzip VERSION="$VERSION"
+          make zip VERSION="$VERSION"
+          cp rockbox.zip ../out/rockbox-ipodvideo.zip
+          cp rockbox-fonts.zip ../out/rockbox-ipodvideo-fonts.zip
+        fi
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: ${{ matrix.name }}
+        path: out/*
+        if-no-files-found: error
+
+  # Everything the iPod needs in one archive: unzip it over the root of the
+  # iPod's disk and it has a complete Rockbox with fonts. The separate zips
+  # stay for people who want less.
+  bundle:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    name: Bundle disk image
+    steps:
+    - uses: actions/download-artifact@v7
+      with:
+        path: parts
+        merge-multiple: true
+    - name: Bundle
+      env:
+        TAG: ${{ needs.version.outputs.tag }}
+      run: |
+        mkdir -p disk out
+        for z in rockbox-ipodvideo.zip rockbox-ipodvideo-fonts.zip; do
+          unzip -oq "parts/$z" -d disk
+        done
+        echo "$TAG" > disk/.rockbox/fork-version.txt
+        (cd disk && zip -qr "../out/rockbox-ipodvideo-$TAG-full.zip" .rockbox)
+        ls -l out
+    - uses: actions/upload-artifact@v7
+      with:
+        name: rockbox-ipodvideo-${{ needs.version.outputs.tag }}-full
+        path: out/*
+        if-no-files-found: error
+
+  publish:
+    needs: [version, build, bundle]
+    if: always() && needs.bundle.result == 'success'
+    runs-on: ubuntu-latest
+    name: Publish release
+    steps:
+    - uses: actions/download-artifact@v7
+      with:
+        path: dist
+        merge-multiple: true
+
+    - name: Checksums
+      run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+    - name: Write notes
+      env:
+        TAG: ${{ needs.version.outputs.tag }}
+      run: |
+        cat > notes.md <<EOF
+        Built from \`${GITHUB_SHA::10}\`. For the iPod Video (5th and 5.5th generation).
+
+        **Install or upgrade:** unzip \`rockbox-ipodvideo-${TAG}-full.zip\` over the root of the iPod's disk (it must be FAT32 / a Windows-formatted iPod). The Rockbox bootloader has to be installed once, with [Rockbox Utility](https://www.rockbox.org/wiki/RockboxUtility) or \`ipodpatcher\` and the \`bootloader-ipodvideo.ipod\` below.
+
+        | File | Put it where |
+        |---|---|
+        | \`rockbox-ipodvideo-${TAG}-full.zip\` | The zips below in one archive. Unzip to the disk root. |
+        | \`rockbox-ipodvideo.zip\` | Unzip to the root of the iPod (creates \`.rockbox/\`). |
+        | \`rockbox-ipodvideo-fonts.zip\` | Optional. Unzip to the disk root, over the above. |
+        | \`bootloader-ipodvideo.ipod\` | Bootloader, for \`ipodpatcher\` / Rockbox Utility. Only needed once. |
+
+        Check downloads against \`SHA256SUMS\`.
+        EOF
+
+    - name: Publish
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        TAG: ${{ needs.version.outputs.tag }}
+      run: |
+        # gh creates the tag on $GITHUB_SHA when it does not exist yet. A
+        # tag made with the workflow's own token starts no workflow run, so
+        # this does not loop back into the tag trigger.
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          gh release upload "$TAG" dist/* --clobber
+        else
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" \
+            --title "$TAG" --notes-file notes.md --generate-notes
+        fi

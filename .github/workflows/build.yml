@@ -1,0 +1,189 @@
+name: Rockbox build
+on:
+  workflow_dispatch:
+    inputs:
+      upload_debug:
+        description: 'Upload debug files'
+        required: false
+        type: boolean
+        default: false
+  push:
+  pull_request:
+
+jobs:
+  # Documentation and pipeline changes cannot change the firmware, so they
+  # do not wait on a device build. tools/release/functional.sh decides what
+  # counts; a change touching anything else builds as before.
+  changes:
+    runs-on: ubuntu-latest
+    name: Detect functional changes
+    outputs:
+      functional: ${{ steps.detect.outputs.functional }}
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Detect
+      id: detect
+      env:
+        BASE_REF: ${{ github.base_ref }}
+        BEFORE: ${{ github.event.before }}
+      run: |
+        if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+          range="origin/$BASE_REF...HEAD"
+        elif [ "$GITHUB_EVENT_NAME" = push ] && [ -n "$BEFORE" ] &&
+             git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+          range="$BEFORE..HEAD"
+        else
+          # A new branch, a manual run: nothing to compare against.
+          echo "functional=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        files=$(sh tools/release/functional.sh "$range")
+        if [ -n "$files" ]; then
+          echo "functional=true" >> "$GITHUB_OUTPUT"
+          echo "Functional changes:"; echo "$files"
+        else
+          echo "functional=false" >> "$GITHUB_OUTPUT"
+          echo "Only documentation and build machinery changed; skipping the device build."
+        fi
+
+  # The same UI as the device, built natively for the runner. No cross
+  # toolchain, so it is the quickest compile check of apps/ and firmware/
+  # common code; the binary is uploaded for anyone who wants to run it.
+  simulator:
+    needs: changes
+    if: needs.changes.outputs.functional == 'true'
+    runs-on: ubuntu-latest
+    name: iPod Video simulator
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      timeout-minutes: 15
+      run: |
+        sudo apt-get -o Acquire::Retries=5 update
+        sudo apt-get -o Acquire::Retries=5 install -y build-essential libsdl2-dev zip gawk
+
+    - name: Build the simulator
+      run: |
+        mkdir sim
+        cd sim
+        ../tools/configure --target=ipodvideo --type=S
+        make -j$(nproc)
+        make install
+
+    - name: Upload simulator
+      uses: actions/upload-artifact@v7
+      with:
+        name: iPod Video simulator
+        path: |
+          sim/rockboxui
+          sim/simdisk/
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.functional == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # This fork targets the iPod Video (5G and 5.5G) only. The
+          # ipodvideo build covers both: 64MB is assumed and reduced at
+          # runtime on the 30GB models.
+          - name: iPod Video
+            arch: a
+            platform: ipodvideo
+
+          - name: iPod Video bootloader
+            arch: a
+            platform: ipodvideo
+            type: B
+
+    runs-on: ubuntu-latest
+    name: ${{matrix.name}}
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      timeout-minutes: 15
+      run: |
+        sudo apt-get -o Acquire::Retries=5 update
+        sudo apt-get -o Acquire::Retries=5 install -y automake bison build-essential ccache flex libc6-dev libgmp3-dev libmpfr-dev \
+        libsdl1.2-dev libtool-bin texinfo zip gawk wget libmpc-dev gettext gtk-doc-tools zlib1g-dev
+
+    - name: root suid tar
+      # workaround for caching system files
+      run: sudo chown root /bin/tar && sudo chmod u+s /bin/tar
+
+    - name: Restore toolchain dependencies
+      id: cache-before
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          /tmp/local
+        key: ${{ runner.os }}-toolchain-${{ matrix.arch }}-${{ hashFiles('tools/rockboxdev.sh') }}
+        restore-keys: |
+          ${{ runner.os }}-toolchain-${{ matrix.arch }}-
+
+    - name: Run rockboxdev.sh
+      if: steps.cache-before.outputs.cache-hit != 'true'
+      run: |
+        cd tools
+        chmod +x rockboxdev.sh
+        sudo ./rockboxdev.sh --target=${{matrix.arch}} --prefix=/tmp/local
+
+    - name: Cache toolchain dependencies
+      if: steps.cache-before.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: |
+          /tmp/local
+        key: ${{ runner.os }}-toolchain-${{ matrix.arch }}-${{ hashFiles('tools/rockboxdev.sh') }}
+
+    - name: Add /tmp/local/bin to PATH
+      run: |
+        echo "/tmp/local/bin" >> $GITHUB_PATH
+
+    - name: Build Rockbox
+      run: |
+        mkdir build
+        cd build
+        ../tools/configure --target=${{matrix.platform}} --type=${{matrix.type || 'N'}}
+        make -j$(nproc)
+        if [ "${{matrix.type}}" != B ]; then make zip; fi
+
+    - name: Upload build
+      uses: actions/upload-artifact@v7
+      if: matrix.type != 'B'
+      with:
+        name: ${{matrix.name}}.zip
+        path: build/rockbox.zip
+
+    - name: Upload bootloader
+      uses: actions/upload-artifact@v7
+      if: matrix.type == 'B'
+      with:
+        name: ${{matrix.name}}
+        path: build/bootloader-ipodvideo.ipod
+        if-no-files-found: error
+
+    - name: Upload debug files
+      if: github.event.inputs.upload_debug
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{matrix.name}}-debug
+        path: |
+          build/**/*.elf
+          build/**/*.map
+          build/**/*.log
+          build/**/*.dmp
+          build/**/*.dump
+
+    - name: Upload log
+      uses: actions/upload-artifact@v7
+      if: failure()
+      with:
+        name: ${{matrix.name}}Logs
+        path: /tmp/rbdev-build/*.log
