@@ -111,6 +111,9 @@
 #ifdef HAVE_DIRCACHE
 #include "dircache.h"
 #endif
+#ifdef HAVE_TAGCACHE
+#include "tagcache.h"
+#endif
 #include "logf.h"
 #include "panic.h"
 
@@ -1935,7 +1938,22 @@ static int alloc_tempbuf(size_t* buflen)
     }
 
     /* otherwise, try being unreasonable */
-    return core_alloc_maximum(buflen, &buflib_ops_locked);
+    handle = core_alloc_maximum(buflen, &buflib_ops_locked);
+
+#ifdef HAVE_TAGCACHE
+    /* A database commit holds all free RAM until it is done: wait it out.
+     * It also holds it for a moment before and after its numbered steps. */
+    long timeout = current_tick + 2*HZ;
+    while (handle < 0 && (tagcache_get_commit_step() > 0 ||
+                          TIME_BEFORE(current_tick, timeout)))
+    {
+        sleep(HZ/10);
+        handle = core_alloc_ex(PLAYLIST_LOAD_BUFLEN, &buflib_ops_locked);
+        *buflen = PLAYLIST_LOAD_BUFLEN;
+    }
+#endif
+
+    return handle;
 }
 
 /*
