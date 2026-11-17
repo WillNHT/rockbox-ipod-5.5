@@ -154,6 +154,10 @@ jobs:
         make -j$(nproc)
         if [ "${{matrix.type}}" != B ]; then make zip; fi
 
+    - name: Memory report
+      if: matrix.type != 'B'
+      run: sh tools/release/memory-report.sh build >> "$GITHUB_STEP_SUMMARY"
+
     - name: Upload build
       uses: actions/upload-artifact@v7
       if: matrix.type != 'B'
